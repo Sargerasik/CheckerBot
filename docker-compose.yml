@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  selenium-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: selenium-bot
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Если нужны переменные окружения (например, токен бота), добавь их так:
+    # environment:
+    #   - TELEGRAM_TOKEN=your_token_here
+    #   - OTHER_VAR=other_value
+    volumes:
+      - ./:/app
+    # Если хочешь пробросить порты — можно раскомментировать:
+    # ports:
+    #   - "8080:8080"
+    command: python bot.py
