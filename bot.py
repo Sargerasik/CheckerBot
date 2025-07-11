@@ -39,8 +39,9 @@ async def send_options(message_or_query, url, force_new=False):
         [InlineKeyboardButton("📧 Email", callback_data='email')],
         [InlineKeyboardButton("💶 Валюта", callback_data='currency')],
         [InlineKeyboardButton("🔗 404 Errors", callback_data='404')],
+        [InlineKeyboardButton("🍪 Cookie Consent", callback_data='cookie')],
         [InlineKeyboardButton("🔍 Проверить всё", callback_data='all')],
-        [InlineKeyboardButton("🔄 Новый сайт", callback_data='new_site')]
+        [InlineKeyboardButton("🔄 Новый сайт", callback_data='new_site')],
     ]
     markup = InlineKeyboardMarkup(keyboard)
     text = f"🔗 Сайт: {url}\nВыбери, что проверить:"
@@ -97,6 +98,10 @@ async def run_checker(mode: str, url: str) -> str:
             ok = checker.check_currency()
             return f"💶 Валюта указана правильно: {'✅' if ok else '❌'}"
 
+        elif mode == 'cookie':
+            consent = checker.check_cookie_consent()
+            return f"🍪 Cookie Consent Banner: {'✅ Найден' if consent else '❌ Не найден'}"
+
         elif mode == '404':
             broken = await checker.check_404_errors()
             if broken:
@@ -110,11 +115,13 @@ async def run_checker(mode: str, url: str) -> str:
             e = checker.check_contact_email()
             c = checker.check_currency()
             b = await checker.check_404_errors()
+            cookie = checker.check_cookie_consent()
 
             parts = [
                 "🔍 Terms & Policies:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()]),
                 f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌ Not found'}",
                 f"💶 Валюта: {'✅' if c else '❌'}",
+                f"🍪 Cookie Consent Banner: {'✅ Найден' if cookie else '❌ Не найден'}",
                 f"🚫 Битые ссылки: \n" + "\n".join([f"{link} ({code})" for link, code in b]) if b else "✅ Все ссылки работают!"
             ]
             return "\n\n".join(parts)

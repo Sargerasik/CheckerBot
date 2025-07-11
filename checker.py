@@ -31,10 +31,39 @@ class WebsiteChecker:
         logger.debug("Chrome-драйвер запущен (headless)")
         return driver
 
-    def check_terms_and_policies(self) -> dict:
-        logger.info("Проверка: Terms, Privacy Policy, Cookie")
+    def check_cookie_consent(self) -> bool:
+        logger.info("Проверка: Cookie Consent Banner")
         self.driver.get(self.base_url)
-        expected = {"terms": False, "privacy policy": False, "cookie": False}
+
+        # Пробуем найти кнопки или блоки, похожие на баннер
+        keywords = ["cookie", "consent", "accept", "agree", "preferences"]
+
+        found = False
+        try:
+            # Ищем кнопки и ссылки
+            buttons = self.driver.find_elements(By.TAG_NAME, "button")
+            links = self.driver.find_elements(By.TAG_NAME, "a")
+            divs = self.driver.find_elements(By.TAG_NAME, "div")
+
+            all_elements = buttons + links + divs
+
+            for elem in all_elements:
+                text = elem.text.strip().lower()
+                if any(k in text for k in keywords):
+                    found = True
+                    logger.info(f"Найден элемент: '{text}'")
+                    break
+
+        except Exception as e:
+            logger.warning(f"Ошибка при поиске cookie consent: {e}")
+
+        logger.info(f"Результат Cookie Consent: {found}")
+        return found
+
+    def check_terms_and_policies(self) -> dict:
+        logger.info("Проверка: Terms, Privacy Policy")
+        self.driver.get(self.base_url)
+        expected = {"terms": False, "privacy policy": False}
         elements = self.driver.find_elements(By.TAG_NAME, "a") + self.driver.find_elements(By.TAG_NAME, "button")
 
         for elem in elements:
@@ -45,8 +74,6 @@ class WebsiteChecker:
                 expected["terms"] = True
             if "privacy policy" in text:
                 expected["privacy policy"] = True
-            if "cookie" in text:
-                expected["cookie"] = True
 
         logger.info(f"Результат Terms & Policies: {expected}")
         return expected
