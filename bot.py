@@ -40,6 +40,7 @@ async def send_options(message_or_query, url, force_new=False):
         [InlineKeyboardButton("💶 Валюта", callback_data='currency')],
         [InlineKeyboardButton("🔗 404 Errors", callback_data='404')],
         [InlineKeyboardButton("🍪 Cookie Consent", callback_data='cookie')],
+        [InlineKeyboardButton("🌐 Язык сайта", callback_data='lang')],
         [InlineKeyboardButton("🔍 Проверить всё", callback_data='all')],
         [InlineKeyboardButton("🔄 Новый сайт", callback_data='new_site')],
     ]
@@ -109,6 +110,17 @@ async def run_checker(mode: str, url: str) -> str:
                 return f"🚫 Найдены битые ссылки:\n{lines}"
             else:
                 return "✅ Все ссылки работают!"
+        elif mode == 'lang':
+            res = checker.check_language_consistency()
+            if res["language"] == "error":
+                result_text = "🌐 Ошибка при определении языка."
+            elif res["language"] == "unknown":
+                result_text = "🌐 Не удалось определить язык сайта."
+            else:
+                lang = res['language'].upper()
+                status = "✅ Однородно" if res["consistent"] else "⚠️ Найдены разные языки"
+                result_text = f"🌐 Язык сайта: {lang}\n{status}"
+            return result_text
 
         elif mode == 'all':
             t = checker.check_terms_and_policies()
@@ -116,16 +128,26 @@ async def run_checker(mode: str, url: str) -> str:
             c = checker.check_currency()
             b = await checker.check_404_errors()
             cookie = checker.check_cookie_consent()
-
+            l = checker.check_language_consistency()
+            lang_part = ""
+            if l["language"] == "error":
+                lang_part = "🌐 Язык: ошибка при определении"
+            elif l["language"] == "unknown":
+                lang_part = "🌐 Язык: не удалось определить"
+            else:
+                lang_code = l["language"].upper()
+                status = "✅ Однородно" if l["consistent"] else "⚠️ Найдены разные языки"
+                lang_part = f"🌐 Язык сайта: {lang_code}\n{status}"
             parts = [
                 "🔍 Terms & Policies:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()]),
                 f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌ Not found'}",
                 f"💶 Валюта: {'✅' if c else '❌'}",
                 f"🍪 Cookie Consent Banner: {'✅ Найден' if cookie else '❌ Не найден'}",
-                f"🚫 Битые ссылки: \n" + "\n".join([f"{link} ({code})" for link, code in b]) if b else "✅ Все ссылки работают!"
+                f"🚫 Битые ссылки:\n" + "\n".join(
+                    [f"{link} ({code})" for link, code in b]) if b else "✅ Все ссылки работают!",
+                lang_part
             ]
             return "\n\n".join(parts)
-
         return "Неизвестная команда."
     finally:
         checker.close()

@@ -1,11 +1,13 @@
 import logging
 import asyncio
 import aiohttp
+from langdetect import detect_langs
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-
+from urllib.parse import urlparse
 import re
 from typing import List, Tuple
 
@@ -16,8 +18,9 @@ logger.setLevel(logging.INFO)
 class WebsiteChecker:
     def __init__(self, base_url: str):
         self.base_url = base_url
-        logger.info(f"Создан WebsiteChecker для URL: {self.base_url}")
+        self.base_domain = urlparse(base_url).netloc.replace("www.", "")
         self.driver = self._get_driver()
+        logger.info(f"Создан WebsiteChecker для URL: {self.base_url}")
 
     def _get_driver(self):
         options = Options()
@@ -30,6 +33,39 @@ class WebsiteChecker:
         driver.implicitly_wait(10)
         logger.debug("Chrome-драйвер запущен (headless)")
         return driver
+
+    def check_language_consistency(self) -> dict:
+        logger.info("Проверка: Language Consistency")
+
+        driver = self._get_driver()
+        driver.get(self.base_url)
+        try:
+            html = driver.page_source
+            soup = BeautifulSoup(html, "html.parser")
+
+            texts = [t.strip() for t in soup.stripped_strings]
+            visible_text = " ".join(texts[:1000])  # Ограничим объём
+
+            if not visible_text:
+                logger.warning("Нет текста для анализа")
+                return {"language": "unknown", "consistent": False}
+
+            langs = detect_langs(visible_text)
+            logger.info(f"Detected langs: {langs}")
+
+            primary = langs[0]
+            is_consistent = all(abs(primary.prob - l.prob) < 0.3 for l in langs)
+
+            return {
+                "language": primary.lang,
+                "probability": round(primary.prob, 2),
+                "consistent": is_consistent
+            }
+        except Exception as e:
+            logger.error(f"Ошибка определения языка: {e}")
+            return {"language": "error", "consistent": False}
+        finally:
+            driver.quit()
 
     def check_cookie_consent(self) -> bool:
         logger.info("Проверка: Cookie Consent Banner")
@@ -130,10 +166,16 @@ class WebsiteChecker:
                     self.driver.get(current_url)
                     anchors = self.driver.find_elements(By.TAG_NAME, "a")
                     logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
+
                     for a in anchors:
                         href = a.get_attribute("href")
-                        if href and self.base_url in href and href not in visited and href not in queue:
+                        if not href:
+                            continue
+                        parsed = urlparse(href)
+                        netloc = parsed.netloc.replace("www.", "")
+                        if netloc == self.base_domain and href not in visited and href not in queue:
                             queue.append(href)
+                            logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
                 except Exception as e:
                     logger.warning(f"Selenium ошибка: {e}")
 
