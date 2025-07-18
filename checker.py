@@ -115,14 +115,70 @@ class WebsiteChecker:
         return expected
 
     def check_contact_email(self) -> dict:
-        logger.info("Проверка: Contact Email")
-        self.driver.get(self.base_url)
-        page_source = self.driver.page_source
-        email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
-        found = re.findall(email_pattern, page_source)
-        unique_emails = list(set(found))
-        logger.info(f"Найдено Email: {unique_emails}")
-        return {"found": bool(unique_emails), "emails": unique_emails}
+        logger.info("Проверка: Contact Email (включая Privacy Policy)")
+        driver = self._get_driver()
+        driver.get(self.base_url)
+        logger.debug(f"Открыт сайт: {self.base_url}")
+
+        try:
+            # --- 1. Ищем email на главной странице ---
+            page_source = driver.page_source
+            email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+            found_main = re.findall(email_pattern, page_source)
+            found_main = list(set(found_main))  # уникальные
+
+            if found_main:
+                logger.info(f"Email найден на главной: {found_main}")
+                return {
+                    "found": True,
+                    "emails": found_main,
+                    "source": "main"
+                }
+
+            # --- 2. Ищем ссылку на Privacy Policy ---
+            logger.info("Email не найден на главной. Пытаемся перейти в Privacy Policy...")
+            elements = driver.find_elements(By.TAG_NAME, "a")
+            privacy_url = None
+            for a in elements:
+                text = a.text.strip().lower()
+                href = a.get_attribute("href")
+                if href and "privacy" in text and "policy" in text:
+                    privacy_url = href
+                    break
+
+            if not privacy_url:
+                logger.warning("Ссылка на Privacy Policy не найдена.")
+                return {
+                    "found": False,
+                    "emails": [],
+                    "source": "none"
+                }
+
+            # --- 3. Переход в Privacy Policy ---
+            logger.info(f"Переход по ссылке: {privacy_url}")
+            driver.get(privacy_url)
+            page_source = driver.page_source
+            found_privacy = re.findall(email_pattern, page_source)
+            found_privacy = list(set(found_privacy))
+
+            if found_privacy:
+                logger.info(f"Email найден в Privacy Policy: {found_privacy}")
+                return {
+                    "found": True,
+                    "emails": found_privacy,
+                    "source": "privacy_policy"
+                }
+
+            logger.info("Email не найден ни на главной, ни в Privacy Policy.")
+            return {
+                "found": False,
+                "emails": [],
+                "source": "none"
+            }
+
+        finally:
+            driver.quit()
+            logger.debug("Драйвер закрыт после проверки Email")
 
     def check_currency(self) -> bool:
         logger.info("Проверка: Валюта")

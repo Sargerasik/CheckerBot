@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 
 user_state = {}
 
+def label_for(data: str) -> str:
+    return {
+        'terms': "Terms & Policies",
+        'email': "Email",
+        'currency': "Валюта",
+        '404': "404 Errors",
+        'cookie': "Cookie Consent",
+        'lang': "Язык сайта",
+        'all': "Полная проверка",
+    }.get(data, data)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state.pop(user_id, None)
@@ -73,9 +85,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = user_data['url']
 
+    # ⚠️ Показываем, что проверка запущена
+    try:
+        await query.edit_message_text(f"⏳ Выполняю проверку «{label_for(query.data)}» для: {url}")
+    except Exception:
+        pass  # Иногда Telegram не даёт изменить сообщение — игнорируем
+
     result_text = await run_checker(query.data, url)
 
+    # ✅ Отправляем результат
     await query.message.reply_text(result_text)
+
+    # 🔁 Возвращаем кнопки
     await send_options(query, url, force_new=True)
 
 async def run_checker(mode: str, url: str) -> str:
@@ -91,9 +112,10 @@ async def run_checker(mode: str, url: str) -> str:
             result = checker.check_contact_email()
             if result['found']:
                 emails = "\n".join(result['emails'])
-                return f"📧 Найденные почты:\n{emails}"
+                location = "на главной" if result['source'] == "main" else "в Privacy Policy"
+                return f"📧 Найденные почты ({location}):\n{emails}"
             else:
-                return "📧 Email не найден 😞"
+                return "📧 Email не найден ни на главной, ни в Privacy Policy."
 
         elif mode == 'currency':
             ok = checker.check_currency()
