@@ -9,6 +9,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from urllib.parse import urlparse
 import re
+from collections import Counter
 from typing import List, Tuple
 
 logger = logging.getLogger("checker")
@@ -180,13 +181,168 @@ class WebsiteChecker:
             driver.quit()
             logger.debug("Драйвер закрыт после проверки Email")
 
-    def check_currency(self) -> bool:
-        logger.info("Проверка: Валюта")
-        self.driver.get(self.base_url)
-        page_source = self.driver.page_source
-        result = "€" in page_source or "£" in page_source
-        logger.info(f"Валюта найдена: {result}")
+    async def check_currency(self) -> dict:
+        logger.info("Проверка: Валюта на всех страницах")
+        visited = set()
+        queue = [self.base_url]
+        symbol_pattern = r"[€$£¥₽₹₩₪₫฿₴₦]"
+        code_pattern = r"\b(?:USD|EUR|RUB|GBP|JPY|CNY|INR|KRW|ILS|VND|THB|UAH|NGN)\b"
+
+        all_symbols = []
+        all_codes = []
+
+        async with aiohttp.ClientSession() as session:
+            while queue:
+                current_url = queue.pop(0)
+                if current_url in visited:
+                    continue
+
+                visited.add(current_url)
+                logger.info(f"Проверка валют на: {current_url}")
+
+                try:
+                    async with session.get(current_url, timeout=10) as resp:
+                        html = await resp.text()
+                except Exception as e:
+                    logger.warning(f"Ошибка загрузки страницы {current_url}: {e}")
+                    continue
+
+                # Очистка от скриптов и стилей
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator=" ")
+
+                # Извлечение валют
+                symbols = re.findall(symbol_pattern, text)
+                codes = re.findall(code_pattern, text, re.IGNORECASE)
+
+                all_symbols.extend(symbols)
+                all_codes.extend(c.upper() for c in codes)
+
+                # Поиск новых ссылок
+                try:
+                    self.driver.get(current_url)
+                    anchors = self.driver.find_elements(By.TAG_NAME, "a")
+                    logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
+
+                    for a in anchors:
+                        href = a.get_attribute("href")
+                        if not href:
+                            continue
+                        parsed = urlparse(href)
+                        netloc = parsed.netloc.replace("www.", "")
+                        if netloc == self.base_domain and href not in visited and href not in queue:
+                            queue.append(href)
+                            logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
+                except Exception as e:
+                    logger.warning(f"Selenium ошибка на {current_url}: {e}")
+
+        symbols_counter = Counter(all_symbols)
+        codes_counter = Counter(all_codes)
+        most_common_symbol = symbols_counter.most_common(1)[0][0] if symbols_counter else None
+
+        result = {
+            "found": bool(symbols_counter or codes_counter),
+            "symbols": dict(symbols_counter),
+            "codes": dict(codes_counter),
+            "most_common_symbol": most_common_symbol
+        }
+
+        logger.info(f"Результат проверки валют: {result}")
         return result
+
+    @staticmethod
+    def extract_phones_from_html(html: str) -> List[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ")
+        return WebsiteChecker.extract_phones_from_text(text)
+
+    @staticmethod
+    def extract_phones_from_text(text: str) -> List[str]:
+        phone_pattern = r"""
+            (?<!\d)                                  # Не цифра перед
+            (?:
+                (?:\+|00)?\d{1,3}[\s\-\.]?           # Код страны
+            )?
+            (?:\(?\d{2,4}\)?[\s\-\.]?)?              # Код региона
+            \d{2,4}[\s\-\.]?\d{2,4}(?:[\s\-\.]?\d{2,4})? # Основной номер
+            (?!\d)                                   # Не цифра после
+        """
+        matches = re.findall(phone_pattern, text, flags=re.VERBOSE)
+        results = []
+
+        for match in matches:
+            digits = re.sub(r"\D", "", match)
+            if 7 <= len(digits) <= 15:
+                results.append(match.strip())
+
+        return list(set(results))
+
+    def check_contact_phone(self) -> dict:
+        logger.info("Проверка: Contact Phone (включая Privacy Policy)")
+        driver = self._get_driver()
+        driver.get(self.base_url)
+        logger.debug(f"Открыт сайт: {self.base_url}")
+
+        try:
+            # --- 1. Поиск на главной ---
+            html = driver.page_source
+            found_main = self.extract_phones_from_html(html)
+
+            if found_main:
+                logger.info(f"Телефоны найдены на главной: {found_main}")
+                return {
+                    "found": True,
+                    "phones": found_main,
+                    "source": "main"
+                }
+
+            # --- 2. Ищем ссылку на Privacy Policy ---
+            logger.info("Телефон не найден на главной. Пытаемся перейти в Privacy Policy...")
+            elements = driver.find_elements(By.TAG_NAME, "a")
+            privacy_url = None
+            for a in elements:
+                text = a.text.strip().lower()
+                href = a.get_attribute("href")
+                if href and "privacy" in text and "policy" in text:
+                    privacy_url = href
+                    break
+
+            if not privacy_url:
+                logger.warning("Ссылка на Privacy Policy не найдена.")
+                return {
+                    "found": False,
+                    "phones": [],
+                    "source": "none"
+                }
+
+            # --- 3. Переход в Privacy Policy ---
+            logger.info(f"Переход по ссылке: {privacy_url}")
+            driver.get(privacy_url)
+            html = driver.page_source
+            found_privacy = self.extract_phones_from_html(html)
+
+            if found_privacy:
+                logger.info(f"Телефоны найдены в Privacy Policy: {found_privacy}")
+                return {
+                    "found": True,
+                    "phones": found_privacy,
+                    "source": "privacy_policy"
+                }
+
+            logger.info("Телефоны не найдены ни на главной, ни в Privacy Policy.")
+            return {
+                "found": False,
+                "phones": [],
+                "source": "none"
+            }
+
+        finally:
+            driver.quit()
+            logger.debug("Драйвер закрыт после проверки телефона")
 
     async def check_404_errors(self) -> List[Tuple[str, int]]:
         logger.info("Проверка: 404 и 500 Errors (async)")

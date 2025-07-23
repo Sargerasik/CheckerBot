@@ -49,7 +49,8 @@ async def send_options(message_or_query, url, force_new=False):
     keyboard = [
         [InlineKeyboardButton("✅ Terms & Policies", callback_data='terms')],
         [InlineKeyboardButton("📧 Email", callback_data='email')],
-        [InlineKeyboardButton("💶 Валюта", callback_data='currency')],
+        [InlineKeyboardButton("📱 Телефон", callback_data='phone')],
+        [InlineKeyboardButton("💶 Используемая валюта", callback_data='currency')],
         [InlineKeyboardButton("🔗 404 Errors", callback_data='404')],
         [InlineKeyboardButton("🍪 Cookie Consent", callback_data='cookie')],
         [InlineKeyboardButton("🌐 Язык сайта", callback_data='lang')],
@@ -117,13 +118,30 @@ async def run_checker(mode: str, url: str) -> str:
             else:
                 return "📧 Email не найден ни на главной, ни в Privacy Policy."
 
+
         elif mode == 'currency':
-            ok = checker.check_currency()
-            return f"💶 Валюта указана правильно: {'✅' if ok else '❌'}"
+            result = await checker.check_currency()
+            if not result["found"] or not result["symbols"]:
+                return "💱 Валюта не найдена на сайте."
+            symbols = ", ".join([f"{sym} ({cnt})" for sym, cnt in result["symbols"].items()])
+            most_common_symbol = result.get("most_common_symbol", "не определён")
+            return (
+                f"💱 Найдены валютные символы/коды:\n{symbols}\n\n"
+                f"🏆 Самый часто используемый: {most_common_symbol}"
+            )
 
         elif mode == 'cookie':
             consent = checker.check_cookie_consent()
             return f"🍪 Cookie Consent Banner: {'✅ Найден' if consent else '❌ Не найден'}"
+
+        elif mode == 'phone':
+            result = checker.check_contact_phone()
+            if result['found']:
+                phones = "\n".join(result['phones'])
+                location = "на главной" if result['source'] == "main" else "в Privacy Policy"
+                return f"📱 Найденные телефоны ({location}):\n{phones}"
+            else:
+                return "📱 Телефон не найден ни на главной, ни в Privacy Policy."
 
         elif mode == '404':
             broken = await checker.check_404_errors()
@@ -143,14 +161,15 @@ async def run_checker(mode: str, url: str) -> str:
                 status = "✅ Однородно" if res["consistent"] else "⚠️ Найдены разные языки"
                 result_text = f"🌐 Язык сайта: {lang}\n{status}"
             return result_text
-
         elif mode == 'all':
             t = checker.check_terms_and_policies()
             e = checker.check_contact_email()
-            c = checker.check_currency()
+            c = await checker.check_currency()  # Асинхронный вызов
             b = await checker.check_404_errors()
             cookie = checker.check_cookie_consent()
             l = checker.check_language_consistency()
+            p = checker.check_contact_phone()
+            # Обработка языка
             lang_part = ""
             if l["language"] == "error":
                 lang_part = "🌐 Язык: ошибка при определении"
@@ -160,20 +179,29 @@ async def run_checker(mode: str, url: str) -> str:
                 lang_code = l["language"].upper()
                 status = "✅ Однородно" if l["consistent"] else "⚠️ Найдены разные языки"
                 lang_part = f"🌐 Язык сайта: {lang_code}\n{status}"
+            # Обработка валют
+            if c["found"] and c["symbols"]:
+                currency_part = (
+                    f"💱 Валюта:\n"
+                    f"{', '.join([f'{sym} ({cnt})' for sym, cnt in c['symbols'].items()])}\n"
+                    f"🏆 Самый часто используемый: {c.get('most_common_symbol', 'не определён')}"
+                )
+            else:
+                currency_part = "💱 Валюта: ❌ Не найдена"
+            # Финальный сбор всех результатов
             parts = [
                 "🔍 Terms & Policies:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()]),
                 f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌ Not found'}",
-                f"💶 Валюта: {'✅' if c else '❌'}",
+                currency_part,
                 f"🍪 Cookie Consent Banner: {'✅ Найден' if cookie else '❌ Не найден'}",
                 f"🚫 Битые ссылки:\n" + "\n".join(
                     [f"{link} ({code})" for link, code in b]) if b else "✅ Все ссылки работают!",
+                f"📱 Телефоны: {'✅ ' + ', '.join(p['phones']) if p['found'] else '❌ Не найдены'}",
                 lang_part
             ]
             return "\n\n".join(parts)
-        return "Неизвестная команда."
     finally:
         checker.close()
-
 def main():
     app = ApplicationBuilder().token("7615217437:AAEpv1d7xQ2CT-IpUBvV70TRxfdHTRikEvE").build()
     app.add_handler(CommandHandler("start", start))
