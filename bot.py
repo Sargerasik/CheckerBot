@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import traceback
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from telegram.ext import (
     ApplicationBuilder,
@@ -200,6 +201,14 @@ async def run_checker(mode: str, url: str) -> str:
                 lang_part
             ]
             return "\n\n".join(parts)
+    except Exception as e:
+        logger.exception("Ошибка в run_checker")
+        return (
+            "❌ Произошла ошибка при выполнении команды.\n\n"
+            f"Тип: {type(e).__name__}\n"
+            f"Сообщение: {str(e)}\n\n"
+            f"Стек:\n{traceback.format_exc(limit=3)}"
+        )
     finally:
         checker.close()
 def main():
