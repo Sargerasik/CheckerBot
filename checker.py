@@ -349,6 +349,7 @@ class WebsiteChecker:
         visited = set()
         broken = []
         queue = [self.base_url]
+        error_codes = {400, 401, 403, 404, 408, 429, 500, 502, 503, 504}
 
         async with aiohttp.ClientSession() as session:
             while queue:
@@ -361,7 +362,7 @@ class WebsiteChecker:
 
                 try:
                     async with session.head(current_url, timeout=5, allow_redirects=True) as resp:
-                        if resp.status in (404, 500):
+                        if resp.status in error_codes:
                             broken.append((current_url, resp.status))
                             continue
                         if resp.status == 200:
