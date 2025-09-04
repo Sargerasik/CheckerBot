@@ -234,13 +234,13 @@ async def run_checker(mode: str, url: str) -> str:
     checker = WebsiteChecker(url)
     try:
         if mode == "terms":
-            t = checker.check_terms_and_policies()
+            t = await checker.check_terms_and_policies()
             return "🔍 Terms:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()])
         elif mode == "email":
-            e = checker.check_contact_email()
+            e = await checker.check_contact_email()
             return f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌'}"
         elif mode == "phone":
-            p = checker.check_contact_phone()
+            p = await checker.check_contact_phone()
             return f"📱 Телефоны: {'✅ ' + ', '.join(p['phones']) if p['found'] else '❌'}"
         elif mode == "currency":
             c = await checker.check_currency()
@@ -249,22 +249,22 @@ async def run_checker(mode: str, url: str) -> str:
             symbols = ", ".join([f"{sym} ({cnt})" for sym, cnt in c['symbols'].items()])
             return f"💱 Валюты:\n{symbols}\n🏆 Чаще всего: {c['most_common_symbol']}"
         elif mode == "cookie":
-            cookie = checker.check_cookie_consent()
+            cookie = await checker.check_cookie_consent()
             return f"🍪 Cookie: {'✅ Найден' if cookie else '❌'}"
         elif mode == "lang":
-            l = checker.check_language_consistency()
+            l = await checker.check_language_consistency()
             return f"🌐 Язык: {l['language'].upper()}, {'✅ Однородно' if l['consistent'] else '⚠️ Разные языки'}"
         elif mode == "404":
             b = await checker.check_404_errors()
             return f"🚫 Битые ссылки:\n" + "\n".join([f"{link} ({code})" for link, code in b]) if b else "✅ Все ссылки работают!"
         elif mode == "all":
-            t = checker.check_terms_and_policies()
-            e = checker.check_contact_email()
+            t = await checker.check_terms_and_policies()
+            e = await checker.check_contact_email()
             c = await checker.check_currency()
             b = await checker.check_404_errors()
-            cookie = checker.check_cookie_consent()
-            l = checker.check_language_consistency()
-            p = checker.check_contact_phone()
+            cookie = await checker.check_cookie_consent()
+            l = await checker.check_language_consistency()
+            p = await checker.check_contact_phone()
             return "\n\n".join([
                 "🔍 Terms:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()]),
                 f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌'}",

@@ -68,7 +68,7 @@ class WebsiteChecker:
         except Exception as e:
             logger.warning(f"Ошибка при удалении временной директории: {e}")
 
-    def check_language_consistency(self) -> dict:
+    async def check_language_consistency(self) -> dict:
         logger.info("Проверка: Language Consistency")
 
         driver = self._get_driver()
@@ -101,7 +101,7 @@ class WebsiteChecker:
         finally:
             driver.quit()
 
-    def check_cookie_consent(self) -> bool:
+    async def check_cookie_consent(self) -> bool:
         logger.info("Проверка: Cookie Consent Banner")
 
         driver = self._get_driver()
@@ -134,7 +134,7 @@ class WebsiteChecker:
         logger.info(f"Результат Cookie Consent: {found}")
         return found
 
-    def check_terms_and_policies(self) -> dict:
+    async def check_terms_and_policies(self) -> dict:
         logger.info("Проверка: Terms, Privacy Policy")
         driver = self._get_driver()
         driver.get(self.base_url)
@@ -159,7 +159,7 @@ class WebsiteChecker:
         logger.info(f"Результат Terms & Policies: {expected}")
         return expected
 
-    def check_contact_email(self) -> dict:
+    async def check_contact_email(self) -> dict:
         logger.info("Проверка: Contact Email (включая Privacy Policy)")
         driver = self._get_driver()
         driver.get(self.base_url)
@@ -331,7 +331,7 @@ class WebsiteChecker:
 
         return list(set(results))
 
-    def check_contact_phone(self) -> dict:
+    async def check_contact_phone(self) -> dict:
         logger.info("Проверка: Contact Phone (включая Privacy Policy)")
         driver = self._get_driver()
         driver.get(self.base_url)
