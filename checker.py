@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import tempfile
+import shutil
 import aiohttp
 from langdetect import detect_langs
 from bs4 import BeautifulSoup
@@ -20,20 +22,51 @@ class WebsiteChecker:
     def __init__(self, base_url: str):
         self.base_url = base_url
         self.base_domain = urlparse(base_url).netloc.replace("www.", "")
-        self.driver = self._get_driver()
+        self._profile_dir = tempfile.mkdtemp(prefix="chrome-profile-")
+        # self.driver = self._get_driver()
         logger.info(f"Создан WebsiteChecker для URL: {self.base_url}")
 
     def _get_driver(self):
         options = Options()
-        options.add_argument("--headless")
+
+        # Надёжный headless, без new
+        options.add_argument("--headless")  # <=== НЕ "--headless=new"
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
         options.add_argument("--log-level=3")
-        driver = webdriver.Chrome(service=Service(), options=options)
-        driver.implicitly_wait(10)
-        logger.debug("Chrome-драйвер запущен (headless)")
-        return driver
+        options.add_argument("--disable-extensions")
+        options.add_argument("--remote-debugging-port=9222")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-sync")
+        options.add_argument("--metrics-recording-only")
+        options.add_argument("--disable-default-apps")
+        options.add_argument("--mute-audio")
+        options.add_argument("--hide-scrollbars")
+
+        # Добавим уникальный профиль — это полезно, но может конфликтовать, если не в temp
+        options.add_argument(f"--user-data-dir={self._profile_dir}")
+
+        try:
+            driver = webdriver.Chrome(service=Service(), options=options)
+            driver.implicitly_wait(10)
+            logger.debug("Chrome-драйвер запущен (headless)")
+            return driver
+        except Exception as e:
+            logger.error(f"Не удалось запустить Chrome: {e}")
+            raise
+
+    def close(self):
+        # try:
+        #     self.driver.quit()
+        #     logger.debug("Драйвер закрыт")
+        # except Exception as e:
+        #     logger.warning(f"Ошибка при закрытии драйвера: {e}")
+
+        try:
+            shutil.rmtree(self._profile_dir, ignore_errors=True)
+            logger.debug(f"Удалена временная директория профиля: {self._profile_dir}")
+        except Exception as e:
+            logger.warning(f"Ошибка при удалении временной директории: {e}")
 
     def check_language_consistency(self) -> dict:
         logger.info("Проверка: Language Consistency")
@@ -70,7 +103,9 @@ class WebsiteChecker:
 
     def check_cookie_consent(self) -> bool:
         logger.info("Проверка: Cookie Consent Banner")
-        self.driver.get(self.base_url)
+
+        driver = self._get_driver()
+        driver.get(self.base_url)
 
         # Пробуем найти кнопки или блоки, похожие на баннер
         keywords = ["cookie", "consent", "accept", "agree", "preferences"]
@@ -78,9 +113,9 @@ class WebsiteChecker:
         found = False
         try:
             # Ищем кнопки и ссылки
-            buttons = self.driver.find_elements(By.TAG_NAME, "button")
-            links = self.driver.find_elements(By.TAG_NAME, "a")
-            divs = self.driver.find_elements(By.TAG_NAME, "div")
+            buttons = driver.find_elements(By.TAG_NAME, "button")
+            links = driver.find_elements(By.TAG_NAME, "a")
+            divs = driver.find_elements(By.TAG_NAME, "div")
 
             all_elements = buttons + links + divs
 
@@ -93,24 +128,33 @@ class WebsiteChecker:
 
         except Exception as e:
             logger.warning(f"Ошибка при поиске cookie consent: {e}")
+        finally:
+            driver.quit()
 
         logger.info(f"Результат Cookie Consent: {found}")
         return found
 
     def check_terms_and_policies(self) -> dict:
         logger.info("Проверка: Terms, Privacy Policy")
-        self.driver.get(self.base_url)
+        driver = self._get_driver()
+        driver.get(self.base_url)
         expected = {"terms": False, "privacy policy": False}
-        elements = self.driver.find_elements(By.TAG_NAME, "a") + self.driver.find_elements(By.TAG_NAME, "button")
 
-        for elem in elements:
-            text = elem.text.strip().lower()
-            if not text:
-                continue
-            if "terms" in text:
-                expected["terms"] = True
-            if "privacy policy" in text:
-                expected["privacy policy"] = True
+        try:
+            elements = driver.find_elements(By.TAG_NAME, "a") + driver.find_elements(By.TAG_NAME, "button")
+
+            for elem in elements:
+                text = elem.text.strip().lower()
+                if not text:
+                    continue
+                if "terms" in text:
+                    expected["terms"] = True
+                if "privacy policy" in text:
+                    expected["privacy policy"] = True
+        except Exception as e:
+            logger.warning(f"Ошибка при поиске terms and policies: {e}")
+        finally:
+            driver.quit()
 
         logger.info(f"Результат Terms & Policies: {expected}")
         return expected
@@ -191,52 +235,58 @@ class WebsiteChecker:
         all_symbols = []
         all_codes = []
 
-        async with aiohttp.ClientSession() as session:
-            while queue:
-                current_url = queue.pop(0)
-                if current_url in visited:
-                    continue
+        driver = self._get_driver()
+        driver.get(self.base_url)
+        try:
+            async with aiohttp.ClientSession() as session:
+                while queue:
+                    current_url = queue.pop(0)
+                    if current_url in visited:
+                        continue
 
-                visited.add(current_url)
-                logger.info(f"Проверка валют на: {current_url}")
+                    visited.add(current_url)
+                    logger.info(f"Проверка валют на: {current_url}")
 
-                try:
-                    async with session.get(current_url, timeout=10) as resp:
-                        html = await resp.text()
-                except Exception as e:
-                    logger.warning(f"Ошибка загрузки страницы {current_url}: {e}")
-                    continue
+                    try:
+                        async with session.get(current_url, timeout=10) as resp:
+                            html = await resp.text()
+                    except Exception as e:
+                        logger.warning(f"Ошибка загрузки страницы {current_url}: {e}")
+                        continue
 
-                # Очистка от скриптов и стилей
-                soup = BeautifulSoup(html, "html.parser")
-                for tag in soup(["script", "style", "noscript"]):
-                    tag.decompose()
-                text = soup.get_text(separator=" ")
+                    # Очистка от скриптов и стилей
+                    soup = BeautifulSoup(html, "html.parser")
+                    for tag in soup(["script", "style", "noscript"]):
+                        tag.decompose()
+                    text = soup.get_text(separator=" ")
 
-                # Извлечение валют
-                symbols = re.findall(symbol_pattern, text)
-                codes = re.findall(code_pattern, text, re.IGNORECASE)
+                    # Извлечение валют
+                    symbols = re.findall(symbol_pattern, text)
+                    codes = re.findall(code_pattern, text, re.IGNORECASE)
 
-                all_symbols.extend(symbols)
-                all_codes.extend(c.upper() for c in codes)
+                    all_symbols.extend(symbols)
+                    all_codes.extend(c.upper() for c in codes)
 
-                # Поиск новых ссылок
-                try:
-                    self.driver.get(current_url)
-                    anchors = self.driver.find_elements(By.TAG_NAME, "a")
-                    logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
+                    # Поиск новых ссылок
+                    try:
+                        driver.get(current_url)
+                        anchors = driver.find_elements(By.TAG_NAME, "a")
+                        logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
 
-                    for a in anchors:
-                        href = a.get_attribute("href")
-                        if not href:
-                            continue
-                        parsed = urlparse(href)
-                        netloc = parsed.netloc.replace("www.", "")
-                        if netloc == self.base_domain and href not in visited and href not in queue:
-                            queue.append(href)
-                            logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
-                except Exception as e:
-                    logger.warning(f"Selenium ошибка на {current_url}: {e}")
+                        for a in anchors:
+                            href = a.get_attribute("href")
+                            if not href:
+                                continue
+                            parsed = urlparse(href)
+                            netloc = parsed.netloc.replace("www.", "")
+                            if netloc == self.base_domain and href not in visited and href not in queue:
+                                queue.append(href)
+                                logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
+                    except Exception as e:
+                        logger.warning(f"Selenium ошибка на {current_url}: {e}")
+        finally:
+            driver.quit()
+            logger.debug("Драйвер закрыт после проверки Валюты")
 
         symbols_counter = Counter(all_symbols)
         codes_counter = Counter(all_codes)
@@ -351,50 +401,53 @@ class WebsiteChecker:
         queue = [self.base_url]
         error_codes = {400, 401, 403, 404, 408, 429, 500, 502, 503, 504}
 
-        async with aiohttp.ClientSession() as session:
-            while queue:
-                current_url = queue.pop(0)
-                if current_url in visited:
-                    continue
+        driver = self._get_driver()
+        driver.get(self.base_url)
 
-                visited.add(current_url)
-                logger.info(f"HEAD+GET для: {current_url}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                while queue:
+                    current_url = queue.pop(0)
+                    if current_url in visited:
+                        continue
 
-                try:
-                    async with session.head(current_url, timeout=5, allow_redirects=True) as resp:
-                        if resp.status in error_codes:
-                            broken.append((current_url, resp.status))
-                            continue
-                        if resp.status == 200:
-                            async with session.get(current_url, timeout=5) as resp2:
-                                if resp2.status in (404, 500):
-                                    broken.append((current_url, resp2.status))
-                                    continue
-                except Exception as e:
-                    logger.warning(f"RequestException: {e}")
-                    broken.append((current_url, 0))
-                    continue
+                    visited.add(current_url)
+                    logger.info(f"HEAD+GET для: {current_url}")
 
-                try:
-                    self.driver.get(current_url)
-                    anchors = self.driver.find_elements(By.TAG_NAME, "a")
-                    logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
+                    try:
+                        async with session.head(current_url, timeout=5, allow_redirects=True) as resp:
+                            if resp.status in error_codes:
+                                broken.append((current_url, resp.status))
+                                continue
+                            if resp.status == 200:
+                                async with session.get(current_url, timeout=5) as resp2:
+                                    if resp2.status in (404, 500):
+                                        broken.append((current_url, resp2.status))
+                                        continue
+                    except Exception as e:
+                        logger.warning(f"RequestException: {e}")
+                        broken.append((current_url, 0))
+                        continue
 
-                    for a in anchors:
-                        href = a.get_attribute("href")
-                        if not href:
-                            continue
-                        parsed = urlparse(href)
-                        netloc = parsed.netloc.replace("www.", "")
-                        if netloc == self.base_domain and href not in visited and href not in queue:
-                            queue.append(href)
-                            logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
-                except Exception as e:
-                    logger.warning(f"Selenium ошибка: {e}")
+                    try:
+                        driver.get(current_url)
+                        anchors = driver.find_elements(By.TAG_NAME, "a")
+                        logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
+
+                        for a in anchors:
+                            href = a.get_attribute("href")
+                            if not href:
+                                continue
+                            parsed = urlparse(href)
+                            netloc = parsed.netloc.replace("www.", "")
+                            if netloc == self.base_domain and href not in visited and href not in queue:
+                                queue.append(href)
+                                logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
+                    except Exception as e:
+                        logger.warning(f"Selenium ошибка: {e}")
+        finally:
+            driver.quit()
+            logger.debug("Драйвер закрыт после проверки 404")
 
         logger.info(f"Обнаружены битые ссылки: {broken}")
         return broken
-
-    def close(self):
-        self.driver.quit()
-        logger.debug("Драйвер закрыт")
