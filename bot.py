@@ -1,9 +1,13 @@
+# bot.py
+import os
 import logging
 import asyncio
 import json
 from pathlib import Path
+from dotenv import load_dotenv
 from urllib.parse import urlparse
 from datetime import datetime
+from typing import Dict, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -12,21 +16,52 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from checker import WebsiteChecker
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 DATA_FILE = Path("user_sites.json")
 
+load_dotenv()  # текущая рабочая директория (PyCharm часто ставит корень проекта)
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("ENV BOT_TOKEN is empty. Set BOT_TOKEN in the environment.")
+
+TZ = os.getenv("TIMEZONE", "Europe/Riga")
+DAILY_HOUR = int(os.getenv("DAILY_HOUR", "9"))
+DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
+
 # === Работа с файлами ===
-def load_user_sites():
+def load_user_sites() -> Dict[str, List[str]]:
     if DATA_FILE.exists():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-def save_user_sites(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+def save_user_sites(data: Dict[str, List[str]]) -> None:
+    tmp = DATA_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(DATA_FILE)
+
+# === Нормализация URL ===
+def normalize_url(url: str) -> str:
+    url = url.strip()
+    if not url:
+        return url
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    parsed = urlparse(url)
+    # минимальная валидация: есть схема и хост
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    # уберём пробелы/капсы в хосте
+    netloc = parsed.netloc.lower()
+    return parsed._replace(netloc=netloc).geturl()
 
 # === Главное меню ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,23 +154,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
 
     if user_data.get("adding_site"):
-        url = update.message.text.strip()
-        data = load_user_sites()
-        sites = data.get(user_id, [])
-        if url not in sites:
-            sites.append(url)
-            data[user_id] = sites
-            save_user_sites(data)
-            await update.message.reply_text(f"✅ Сайт добавлен: {url}")
+        raw = update.message.text.strip()
+        url = normalize_url(raw)
+        if not url:
+            await update.message.reply_text("❌ Некорректный URL, попробуй ещё раз (например, https://example.com).")
         else:
-            await update.message.reply_text("⚠️ Этот сайт уже есть в списке.")
+            data = load_user_sites()
+            sites = data.get(user_id, [])
+            if url not in sites:
+                sites.append(url)
+                data[user_id] = sites
+                save_user_sites(data)
+                await update.message.reply_text(f"✅ Сайт добавлен: {url}")
+            else:
+                await update.message.reply_text("⚠️ Этот сайт уже есть в списке.")
         user_data["adding_site"] = False
         return
 
     if user_data.get("checking_site"):
-        url = update.message.text.strip()
+        raw = update.message.text.strip()
+        url = normalize_url(raw)
         user_data["checking_site"] = False
-        await site_menu(update.message, url)
+        if not url:
+            await update.message.reply_text("❌ Некорректный URL.")
+        else:
+            await site_menu(update.message, url)
         return
 
     await update.message.reply_text("⚠️ Используйте меню для выбора действия.")
@@ -155,6 +198,58 @@ async def site_menu(message_or_query, url):
     ]
     await message_or_query.reply_text(f"🔗 Сайт: {url}", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# === Логика проверок (обёртки вокруг sync методов) ===
+async def run_checker(mode: str, url: str) -> str:
+    checker = WebsiteChecker(url)
+    # Все вызовы идут через to_thread, чтобы Selenium не блокировал event loop
+    if mode == "terms":
+        t = await asyncio.to_thread(checker.check_terms_and_policies)
+        return "🔍 Terms:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()])
+    elif mode == "email":
+        e = await asyncio.to_thread(checker.check_contact_email)
+        return f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌'}"
+    elif mode == "phone":
+        p = await asyncio.to_thread(checker.check_contact_phone)
+        return f"📱 Телефоны: {'✅ ' + ', '.join(p['phones']) if p['found'] else '❌'}"
+    elif mode == "currency":
+        c = await asyncio.to_thread(checker.check_currency)
+        if not c["found"]:
+            return "💱 Валюта не найдена"
+        symbols = ", ".join([f"{sym} ({cnt})" for sym, cnt in c['symbols'].items()])
+        codes = ", ".join([f"{code} ({cnt})" for code, cnt in c['codes'].items()])
+        most = c['most_common_symbol'] or "-"
+        return f"💱 Валюты:\n{symbols}\n🧾 Коды: {codes}\n🏆 Чаще всего: {most}"
+    elif mode == "cookie":
+        cookie = await asyncio.to_thread(checker.check_cookie_consent)
+        return f"🍪 Cookie: {'✅ Найден' if cookie else '❌'}"
+    elif mode == "lang":
+        l = await asyncio.to_thread(checker.check_language_consistency)
+        return f"🌐 Язык: {l['language'].upper()}, {'✅ Однородно' if l['consistent'] else '⚠️ Разные языки'} (p={l.get('probability', 0)})"
+    elif mode == "404":
+        b = await asyncio.to_thread(checker.check_404_errors)
+        return (f"🚫 Битые/проблемные ссылки:\n" + "\n".join([f"{link} ({code})" for link, code in b])) if b else "✅ Все ссылки работают!"
+    elif mode == "all":
+        # Последовательно, чтобы не плодить много Chrome-процессов
+        t = await asyncio.to_thread(checker.check_terms_and_policies)
+        e = await asyncio.to_thread(checker.check_contact_email)
+        c = await asyncio.to_thread(checker.check_currency)
+        b = await asyncio.to_thread(checker.check_404_errors)
+        cookie = await asyncio.to_thread(checker.check_cookie_consent)
+        l = await asyncio.to_thread(checker.check_language_consistency)
+        p = await asyncio.to_thread(checker.check_contact_phone)
+        parts = [
+            "🔍 Terms:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()]),
+            f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌'}",
+            "💱 Валюта: " + (", ".join([f"{sym} ({cnt})" for sym, cnt in c['symbols'].items()]) if c['found'] else "❌"),
+            f"🍪 Cookie: {'✅ Найден' if cookie else '❌'}",
+            (f"🚫 Битые/проблемные ссылки:\n" + "\n".join([f"{link} ({code})" for link, code in b])) if b else "✅ Все ссылки работают",
+            f"📱 Возможные телефоны: {'✅ ' + ', '.join(p['phones']) if p['found'] else '❌'}",
+            f"🌐 Язык: {l['language'].upper()}, {'✅ Однородно' if l['consistent'] else '⚠️'} (p={l.get('probability', 0)})"
+        ]
+        return "\n\n".join(parts)
+    else:
+        return "Неизвестная команда"
+
 # === Обработка кнопок проверок ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -172,15 +267,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = data.split("_", 1)[1].strip()
     parsed = urlparse(url)
-
-    # ✅ Проверяем корректность URL
     if not parsed.scheme or not parsed.netloc:
         await query.message.reply_text("❌ Ошибка: Некорректный URL")
         logger.error(f"Некорректный URL в callback: {url}")
         return
 
     await query.message.reply_text("🔄 Проверка запущена...")
-
     try:
         result = await run_checker(mode, url)
         await query.message.reply_text(result[:4000])
@@ -188,7 +280,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Ошибка при проверке")
         await query.message.reply_text(f"❌ Ошибка при проверке сайта: {e}")
 
-# === Проверка всех сайтов ===
+# === Проверка всех сайтов (из списка пользователя) ===
 async def check_all_sites(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -222,65 +314,21 @@ async def run_daily_checks(app):
             except Exception as e:
                 report.append(f"❌ {url}: {e}")
         if report:
-            await bot.send_message(chat_id=user_id, text="\n\n".join(report)[:4000])
+            try:
+                await bot.send_message(chat_id=user_id, text="\n\n".join(report)[:4000])
+            except Exception:
+                logger.exception(f"Не удалось отправить отчёт пользователю {user_id}")
 
 async def on_startup(app):
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(run_daily_checks, "interval", hours=24, args=[app])
+    scheduler = AsyncIOScheduler(timezone=TZ)
+    # каждый день в указанное время
+    scheduler.add_job(run_daily_checks, "cron", hour=DAILY_HOUR, minute=DAILY_MINUTE, args=[app])
     scheduler.start()
-
-# === Логика проверок ===
-async def run_checker(mode: str, url: str) -> str:
-    checker = WebsiteChecker(url)
-    try:
-        if mode == "terms":
-            t = await checker.check_terms_and_policies()
-            return "🔍 Terms:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()])
-        elif mode == "email":
-            e = await checker.check_contact_email()
-            return f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌'}"
-        elif mode == "phone":
-            p = await checker.check_contact_phone()
-            return f"📱 Телефоны: {'✅ ' + ', '.join(p['phones']) if p['found'] else '❌'}"
-        elif mode == "currency":
-            c = await checker.check_currency()
-            if not c["found"]:
-                return "💱 Валюта не найдена"
-            symbols = ", ".join([f"{sym} ({cnt})" for sym, cnt in c['symbols'].items()])
-            return f"💱 Валюты:\n{symbols}\n🏆 Чаще всего: {c['most_common_symbol']}"
-        elif mode == "cookie":
-            cookie = await checker.check_cookie_consent()
-            return f"🍪 Cookie: {'✅ Найден' if cookie else '❌'}"
-        elif mode == "lang":
-            l = await checker.check_language_consistency()
-            return f"🌐 Язык: {l['language'].upper()}, {'✅ Однородно' if l['consistent'] else '⚠️ Разные языки'}"
-        elif mode == "404":
-            b = await checker.check_404_errors()
-            return f"🚫 Битые ссылки:\n" + "\n".join([f"{link} ({code})" for link, code in b]) if b else "✅ Все ссылки работают!"
-        elif mode == "all":
-            t = await checker.check_terms_and_policies()
-            e = await checker.check_contact_email()
-            c = await checker.check_currency()
-            b = await checker.check_404_errors()
-            cookie = await checker.check_cookie_consent()
-            l = await checker.check_language_consistency()
-            p = await checker.check_contact_phone()
-            return "\n\n".join([
-                "🔍 Terms:\n" + "\n".join([f"{k}: {'✅' if v else '❌'}" for k, v in t.items()]),
-                f"📧 Email: {'✅ ' + ', '.join(e['emails']) if e['found'] else '❌'}",
-                f"💱 Валюта: " + (", ".join([f"{sym} ({cnt})" for sym, cnt in c['symbols'].items()]) if c['found'] else "❌"),
-                f"🍪 Cookie: {'✅ Найден' if cookie else '❌'}",
-                f"🚫 Битые ссылки:\n" + "\n".join([f"{link} ({code})" for link, code in b]) if b else "✅ Все ссылки работают",
-                f"📱 Возможные телефоны: {'✅ ' + ', '.join(p['phones']) if p['found'] else '❌'}",
-                f"🌐 Язык: {l['language'].upper()}, {'✅ Однородно' if l['consistent'] else '⚠️'}"
-            ])
-        return "Неизвестная команда"
-    finally:
-        checker.close()
+    logger.info(f"Scheduler started: daily {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} {TZ}")
 
 # === MAIN ===
 def main():
-    app = ApplicationBuilder().token("7615217437:AAEpv1d7xQ2CT-IpUBvV70TRxfdHTRikEvE").post_init(on_startup).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
     app.add_handler(CallbackQueryHandler(autocheck_menu, pattern="^autocheck_menu$"))

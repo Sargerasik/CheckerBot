@@ -1,306 +1,187 @@
+# checker.py
 import logging
-import asyncio
 import tempfile
 import shutil
-import aiohttp
-from langdetect import detect_langs
+import re
+import requests
 from bs4 import BeautifulSoup
+from langdetect import detect_langs
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from urllib.parse import urlparse
-import re
+from urllib.parse import urlparse, urljoin
 from collections import Counter
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 logger = logging.getLogger("checker")
 logger.setLevel(logging.INFO)
 
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/122.0.0.0 Safari/537.36"
+}
 
 class WebsiteChecker:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, max_pages: int = 50):
         self.base_url = base_url
-        self.base_domain = urlparse(base_url).netloc.replace("www.", "")
+        self.base_domain = urlparse(base_url).netloc.replace("www.", "").lower()
         self._profile_dir = tempfile.mkdtemp(prefix="chrome-profile-")
-        # self.driver = self._get_driver()
+        self.max_pages = max_pages
         logger.info(f"Создан WebsiteChecker для URL: {self.base_url}")
 
+    # --- Chrome driver ---
     def _get_driver(self):
         options = Options()
-
-        # Надёжный headless, без new
-        options.add_argument("--headless")  # <=== НЕ "--headless=new"
+        # Надёжный headless
+        options.add_argument("--headless")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
         options.add_argument("--disable-extensions")
-        options.add_argument("--remote-debugging-port=9222")
         options.add_argument("--disable-background-networking")
         options.add_argument("--disable-sync")
         options.add_argument("--metrics-recording-only")
         options.add_argument("--disable-default-apps")
         options.add_argument("--mute-audio")
         options.add_argument("--hide-scrollbars")
-
-        # Добавим уникальный профиль — это полезно, но может конфликтовать, если не в temp
         options.add_argument(f"--user-data-dir={self._profile_dir}")
+        options.add_argument("--window-size=1280,1024")
+        options.add_argument("--lang=en-US")
 
         try:
             driver = webdriver.Chrome(service=Service(), options=options)
             driver.implicitly_wait(10)
-            logger.debug("Chrome-драйвер запущен (headless)")
             return driver
         except Exception as e:
             logger.error(f"Не удалось запустить Chrome: {e}")
             raise
 
     def close(self):
-        # try:
-        #     self.driver.quit()
-        #     logger.debug("Драйвер закрыт")
-        # except Exception as e:
-        #     logger.warning(f"Ошибка при закрытии драйвера: {e}")
-
         try:
             shutil.rmtree(self._profile_dir, ignore_errors=True)
-            logger.debug(f"Удалена временная директория профиля: {self._profile_dir}")
         except Exception as e:
             logger.warning(f"Ошибка при удалении временной директории: {e}")
 
-    async def check_language_consistency(self) -> dict:
-        logger.info("Проверка: Language Consistency")
+    # --- Helpers ---
+    def _same_site(self, href: str) -> bool:
+        """Проверка, что ссылка принадлежит тому же сайту (вкл. поддомены)."""
+        parsed = urlparse(href)
+        netloc = parsed.netloc.replace("www.", "").lower()
+        return netloc.endswith(self.base_domain)
 
+    def _extract_internal_links(self, base: str, html: str) -> List[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = urljoin(base, a["href"])
+            if href.startswith("mailto:") or href.startswith("tel:"):
+                continue
+            if self._same_site(href):
+                links.append(href)
+        return list(dict.fromkeys(links))  # уникальность, сохранение порядка
+
+    # --- Checks (sync) ---
+    def check_language_consistency(self) -> Dict[str, object]:
+        logger.info("Проверка: Language Consistency")
         driver = self._get_driver()
-        driver.get(self.base_url)
         try:
+            driver.get(self.base_url)
             html = driver.page_source
             soup = BeautifulSoup(html, "html.parser")
-
             texts = [t.strip() for t in soup.stripped_strings]
-            visible_text = " ".join(texts[:1000])  # Ограничим объём
+            visible_text = " ".join(texts[:2000])
 
-            if not visible_text:
-                logger.warning("Нет текста для анализа")
-                return {"language": "unknown", "consistent": False}
+            if len(visible_text) < 50:
+                return {"language": "unknown", "probability": 0.0, "consistent": False}
 
             langs = detect_langs(visible_text)
-            logger.info(f"Detected langs: {langs}")
-
             primary = langs[0]
             is_consistent = all(abs(primary.prob - l.prob) < 0.3 for l in langs)
-
-            return {
-                "language": primary.lang,
-                "probability": round(primary.prob, 2),
-                "consistent": is_consistent
-            }
+            return {"language": primary.lang, "probability": round(primary.prob, 2), "consistent": is_consistent}
         except Exception as e:
             logger.error(f"Ошибка определения языка: {e}")
-            return {"language": "error", "consistent": False}
+            return {"language": "error", "probability": 0.0, "consistent": False}
         finally:
             driver.quit()
 
-    async def check_cookie_consent(self) -> bool:
+    def check_cookie_consent(self) -> bool:
         logger.info("Проверка: Cookie Consent Banner")
-
+        keywords = [
+            "cookie", "cookies", "consent", "accept", "agree", "preferences",
+            "куки", "cookie-файлы", "согласие", "принять", "настройки"
+        ]
         driver = self._get_driver()
-        driver.get(self.base_url)
-
-        # Пробуем найти кнопки или блоки, похожие на баннер
-        keywords = ["cookie", "consent", "accept", "agree", "preferences"]
-
-        found = False
         try:
-            # Ищем кнопки и ссылки
-            buttons = driver.find_elements(By.TAG_NAME, "button")
-            links = driver.find_elements(By.TAG_NAME, "a")
-            divs = driver.find_elements(By.TAG_NAME, "div")
-
-            all_elements = buttons + links + divs
-
-            for elem in all_elements:
-                text = elem.text.strip().lower()
-                if any(k in text for k in keywords):
-                    found = True
-                    logger.info(f"Найден элемент: '{text}'")
-                    break
-
-        except Exception as e:
-            logger.warning(f"Ошибка при поиске cookie consent: {e}")
-        finally:
-            driver.quit()
-
-        logger.info(f"Результат Cookie Consent: {found}")
-        return found
-
-    async def check_terms_and_policies(self) -> dict:
-        logger.info("Проверка: Terms, Privacy Policy")
-        driver = self._get_driver()
-        driver.get(self.base_url)
-        expected = {"terms": False, "privacy policy": False}
-
-        try:
-            elements = driver.find_elements(By.TAG_NAME, "a") + driver.find_elements(By.TAG_NAME, "button")
-
+            driver.get(self.base_url)
+            elements = driver.find_elements(By.CSS_SELECTOR, "button, a, div")
             for elem in elements:
-                text = elem.text.strip().lower()
+                text = (elem.text or "").strip().lower()
                 if not text:
                     continue
-                if "terms" in text:
-                    expected["terms"] = True
-                if "privacy policy" in text:
-                    expected["privacy policy"] = True
+                if any(k in text for k in keywords):
+                    logger.info(f"Найден элемент баннера: '{text}'")
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"Ошибка при поиске cookie consent: {e}")
+            return False
+        finally:
+            driver.quit()
+
+    def check_terms_and_policies(self) -> Dict[str, bool]:
+        logger.info("Проверка: Terms, Privacy Policy")
+        driver = self._get_driver()
+        try:
+            driver.get(self.base_url)
+            elements = driver.find_elements(By.CSS_SELECTOR, "a, button")
+            textset = set((e.text or "").strip().lower() for e in elements if (e.text or "").strip())
+
+            terms_keys = {"terms", "terms of service", "terms & conditions", "условия", "пользовательское соглашение"}
+            policy_keys = {"privacy policy", "privacy", "политика конфиденциальности", "конфиденциальность"}
+
+            found_terms = any(any(k in t for k in terms_keys) for t in textset)
+            found_policy = any(any(k in t for k in policy_keys) for t in textset)
+
+            return {"terms": found_terms, "privacy policy": found_policy}
         except Exception as e:
             logger.warning(f"Ошибка при поиске terms and policies: {e}")
+            return {"terms": False, "privacy policy": False}
         finally:
             driver.quit()
 
-        logger.info(f"Результат Terms & Policies: {expected}")
-        return expected
-
-    async def check_contact_email(self) -> dict:
-        logger.info("Проверка: Contact Email (включая Privacy Policy)")
+    def check_contact_email(self) -> Dict[str, object]:
+        logger.info("Проверка: Contact Email")
+        email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
         driver = self._get_driver()
-        driver.get(self.base_url)
-        logger.debug(f"Открыт сайт: {self.base_url}")
-
         try:
-            # --- 1. Ищем email на главной странице ---
+            # 1) главная
+            driver.get(self.base_url)
             page_source = driver.page_source
-            email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
-            found_main = re.findall(email_pattern, page_source)
-            found_main = list(set(found_main))  # уникальные
-
+            found_main = sorted(set(re.findall(email_pattern, page_source)))
             if found_main:
-                logger.info(f"Email найден на главной: {found_main}")
-                return {
-                    "found": True,
-                    "emails": found_main,
-                    "source": "main"
-                }
+                return {"found": True, "emails": found_main, "source": "main"}
 
-            # --- 2. Ищем ссылку на Privacy Policy ---
-            logger.info("Email не найден на главной. Пытаемся перейти в Privacy Policy...")
-            elements = driver.find_elements(By.TAG_NAME, "a")
+            # 2) privacy policy
+            links = driver.find_elements(By.TAG_NAME, "a")
             privacy_url = None
-            for a in elements:
-                text = a.text.strip().lower()
+            for a in links:
+                text = (a.text or "").strip().lower()
                 href = a.get_attribute("href")
-                if href and "privacy" in text and "policy" in text:
+                if href and ("privacy" in text and "policy" in text):
                     privacy_url = href
                     break
-
             if not privacy_url:
-                logger.warning("Ссылка на Privacy Policy не найдена.")
-                return {
-                    "found": False,
-                    "emails": [],
-                    "source": "none"
-                }
+                return {"found": False, "emails": [], "source": "none"}
 
-            # --- 3. Переход в Privacy Policy ---
-            logger.info(f"Переход по ссылке: {privacy_url}")
             driver.get(privacy_url)
-            page_source = driver.page_source
-            found_privacy = re.findall(email_pattern, page_source)
-            found_privacy = list(set(found_privacy))
-
+            found_privacy = sorted(set(re.findall(email_pattern, driver.page_source)))
             if found_privacy:
-                logger.info(f"Email найден в Privacy Policy: {found_privacy}")
-                return {
-                    "found": True,
-                    "emails": found_privacy,
-                    "source": "privacy_policy"
-                }
-
-            logger.info("Email не найден ни на главной, ни в Privacy Policy.")
-            return {
-                "found": False,
-                "emails": [],
-                "source": "none"
-            }
-
+                return {"found": True, "emails": found_privacy, "source": "privacy_policy"}
+            return {"found": False, "emails": [], "source": "none"}
         finally:
             driver.quit()
-            logger.debug("Драйвер закрыт после проверки Email")
-
-    async def check_currency(self) -> dict:
-        logger.info("Проверка: Валюта на всех страницах")
-        visited = set()
-        queue = [self.base_url]
-        symbol_pattern = r"[€$£¥₽₹₩₪₫฿₴₦]"
-        code_pattern = r"\b(?:USD|EUR|RUB|GBP|JPY|CNY|INR|KRW|ILS|VND|THB|UAH|NGN)\b"
-
-        all_symbols = []
-        all_codes = []
-
-        driver = self._get_driver()
-        driver.get(self.base_url)
-        try:
-            async with aiohttp.ClientSession() as session:
-                while queue:
-                    current_url = queue.pop(0)
-                    if current_url in visited:
-                        continue
-
-                    visited.add(current_url)
-                    logger.info(f"Проверка валют на: {current_url}")
-
-                    try:
-                        async with session.get(current_url, timeout=10) as resp:
-                            html = await resp.text()
-                    except Exception as e:
-                        logger.warning(f"Ошибка загрузки страницы {current_url}: {e}")
-                        continue
-
-                    # Очистка от скриптов и стилей
-                    soup = BeautifulSoup(html, "html.parser")
-                    for tag in soup(["script", "style", "noscript"]):
-                        tag.decompose()
-                    text = soup.get_text(separator=" ")
-
-                    # Извлечение валют
-                    symbols = re.findall(symbol_pattern, text)
-                    codes = re.findall(code_pattern, text, re.IGNORECASE)
-
-                    all_symbols.extend(symbols)
-                    all_codes.extend(c.upper() for c in codes)
-
-                    # Поиск новых ссылок
-                    try:
-                        driver.get(current_url)
-                        anchors = driver.find_elements(By.TAG_NAME, "a")
-                        logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
-
-                        for a in anchors:
-                            href = a.get_attribute("href")
-                            if not href:
-                                continue
-                            parsed = urlparse(href)
-                            netloc = parsed.netloc.replace("www.", "")
-                            if netloc == self.base_domain and href not in visited and href not in queue:
-                                queue.append(href)
-                                logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
-                    except Exception as e:
-                        logger.warning(f"Selenium ошибка на {current_url}: {e}")
-        finally:
-            driver.quit()
-            logger.debug("Драйвер закрыт после проверки Валюты")
-
-        symbols_counter = Counter(all_symbols)
-        codes_counter = Counter(all_codes)
-        most_common_symbol = symbols_counter.most_common(1)[0][0] if symbols_counter else None
-
-        result = {
-            "found": bool(symbols_counter or codes_counter),
-            "symbols": dict(symbols_counter),
-            "codes": dict(codes_counter),
-            "most_common_symbol": most_common_symbol
-        }
-
-        logger.info(f"Результат проверки валют: {result}")
-        return result
 
     @staticmethod
     def extract_phones_from_html(html: str) -> List[str]:
@@ -313,141 +194,139 @@ class WebsiteChecker:
     @staticmethod
     def extract_phones_from_text(text: str) -> List[str]:
         phone_pattern = r"""
-            (?<!\d)                                  # Не цифра перед
-            (?:
-                (?:\+|00)?\d{1,3}[\s\-\.]?           # Код страны
-            )?
-            (?:\(?\d{2,4}\)?[\s\-\.]?)?              # Код региона
-            \d{2,4}[\s\-\.]?\d{2,4}(?:[\s\-\.]?\d{2,4})? # Основной номер
-            (?!\d)                                   # Не цифра после
+            (?<!\d)
+            (?:(?:\+|00)?\d{1,3}[\s\-\.]?)?
+            (?:\(?\d{2,4}\)?[\s\-\.]?)?
+            \d{2,4}[\s\-\.]?\d{2,4}(?:[\s\-\.]?\d{2,4})?
+            (?!\d)
         """
         matches = re.findall(phone_pattern, text, flags=re.VERBOSE)
         results = []
-
-        for match in matches:
-            digits = re.sub(r"\D", "", match)
+        for m in matches:
+            digits = re.sub(r"\D", "", m)
             if 7 <= len(digits) <= 15:
-                results.append(match.strip())
+                results.append(m.strip())
+        return list(sorted(set(results)))
 
-        return list(set(results))
-
-    async def check_contact_phone(self) -> dict:
-        logger.info("Проверка: Contact Phone (включая Privacy Policy)")
+    def check_contact_phone(self) -> Dict[str, object]:
+        logger.info("Проверка: Contact Phone")
         driver = self._get_driver()
-        driver.get(self.base_url)
-        logger.debug(f"Открыт сайт: {self.base_url}")
-
         try:
-            # --- 1. Поиск на главной ---
-            html = driver.page_source
-            found_main = self.extract_phones_from_html(html)
-
+            driver.get(self.base_url)
+            found_main = self.extract_phones_from_html(driver.page_source)
             if found_main:
-                logger.info(f"Телефоны найдены на главной: {found_main}")
-                return {
-                    "found": True,
-                    "phones": found_main,
-                    "source": "main"
-                }
+                return {"found": True, "phones": found_main, "source": "main"}
 
-            # --- 2. Ищем ссылку на Privacy Policy ---
-            logger.info("Телефон не найден на главной. Пытаемся перейти в Privacy Policy...")
-            elements = driver.find_elements(By.TAG_NAME, "a")
+            links = driver.find_elements(By.TAG_NAME, "a")
             privacy_url = None
-            for a in elements:
-                text = a.text.strip().lower()
+            for a in links:
+                text = (a.text or "").strip().lower()
                 href = a.get_attribute("href")
-                if href and "privacy" in text and "policy" in text:
+                if href and ("privacy" in text and "policy" in text):
                     privacy_url = href
                     break
-
             if not privacy_url:
-                logger.warning("Ссылка на Privacy Policy не найдена.")
-                return {
-                    "found": False,
-                    "phones": [],
-                    "source": "none"
-                }
+                return {"found": False, "phones": [], "source": "none"}
 
-            # --- 3. Переход в Privacy Policy ---
-            logger.info(f"Переход по ссылке: {privacy_url}")
             driver.get(privacy_url)
-            html = driver.page_source
-            found_privacy = self.extract_phones_from_html(html)
-
+            found_privacy = self.extract_phones_from_html(driver.page_source)
             if found_privacy:
-                logger.info(f"Телефоны найдены в Privacy Policy: {found_privacy}")
-                return {
-                    "found": True,
-                    "phones": found_privacy,
-                    "source": "privacy_policy"
-                }
-
-            logger.info("Телефоны не найдены ни на главной, ни в Privacy Policy.")
-            return {
-                "found": False,
-                "phones": [],
-                "source": "none"
-            }
-
+                return {"found": True, "phones": found_privacy, "source": "privacy_policy"}
+            return {"found": False, "phones": [], "source": "none"}
         finally:
             driver.quit()
-            logger.debug("Драйвер закрыт после проверки телефона")
 
-    async def check_404_errors(self) -> List[Tuple[str, int]]:
-        logger.info("Проверка: 404 и 500 Errors (async)")
-        visited = set()
-        broken = []
-        queue = [self.base_url]
-        error_codes = {400, 401, 403, 404, 408, 429, 500, 502, 503, 504}
+    def check_currency(self) -> Dict[str, object]:
+        logger.info("Проверка: Валюта на страницах")
+        visited, queue = set(), [self.base_url]
+        symbol_pattern = re.compile(r"[€$£¥₽₹₩₪₫฿₴₦]")
+        code_pattern = re.compile(r"\b(?:USD|EUR|RUB|GBP|JPY|CNY|INR|KRW|ILS|VND|THB|UAH|NGN)\b", re.IGNORECASE)
 
-        driver = self._get_driver()
-        driver.get(self.base_url)
+        symbols, codes = [], []
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                while queue:
-                    current_url = queue.pop(0)
-                    if current_url in visited:
-                        continue
+        session = requests.Session()
+        session.headers.update(DEFAULT_HEADERS)
 
-                    visited.add(current_url)
-                    logger.info(f"HEAD+GET для: {current_url}")
+        pages = 0
+        while queue and pages < self.max_pages:
+            current_url = queue.pop(0)
+            if current_url in visited:
+                continue
+            visited.add(current_url)
+            pages += 1
 
-                    try:
-                        async with session.head(current_url, timeout=5, allow_redirects=True) as resp:
-                            if resp.status in error_codes:
-                                broken.append((current_url, resp.status))
-                                continue
-                            if resp.status == 200:
-                                async with session.get(current_url, timeout=5) as resp2:
-                                    if resp2.status in (404, 500):
-                                        broken.append((current_url, resp2.status))
-                                        continue
-                    except Exception as e:
-                        logger.warning(f"RequestException: {e}")
-                        broken.append((current_url, 0))
-                        continue
+            try:
+                resp = session.get(current_url, timeout=10)
+                html = resp.text
+            except Exception as e:
+                logger.warning(f"Ошибка загрузки {current_url}: {e}")
+                continue
 
-                    try:
-                        driver.get(current_url)
-                        anchors = driver.find_elements(By.TAG_NAME, "a")
-                        logger.debug(f"Найдено ссылок: {len(anchors)} на {current_url}")
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            text = soup.get_text(separator=" ")
 
-                        for a in anchors:
-                            href = a.get_attribute("href")
-                            if not href:
-                                continue
-                            parsed = urlparse(href)
-                            netloc = parsed.netloc.replace("www.", "")
-                            if netloc == self.base_domain and href not in visited and href not in queue:
-                                queue.append(href)
-                                logger.info(f"Добавлена в очередь внутренняя ссылка: {href}")
-                    except Exception as e:
-                        logger.warning(f"Selenium ошибка: {e}")
-        finally:
-            driver.quit()
-            logger.debug("Драйвер закрыт после проверки 404")
+            symbols.extend(symbol_pattern.findall(text))
+            codes.extend(c.upper() for c in code_pattern.findall(text))
 
-        logger.info(f"Обнаружены битые ссылки: {broken}")
+            # новые ссылки
+            for href in self._extract_internal_links(current_url, html):
+                if href not in visited and href not in queue:
+                    queue.append(href)
+
+        symbols_counter = Counter(symbols)
+        codes_counter = Counter(codes)
+        most_common_symbol = symbols_counter.most_common(1)[0][0] if symbols_counter else None
+        return {
+            "found": bool(symbols_counter or codes_counter),
+            "symbols": dict(symbols_counter),
+            "codes": dict(codes_counter),
+            "most_common_symbol": most_common_symbol
+        }
+
+    def check_404_errors(self) -> List[Tuple[str, int]]:
+        logger.info("Проверка: 4xx/5xx ошибок")
+        visited, queue = set(), [self.base_url]
+        broken: List[Tuple[str, int]] = []
+
+        session = requests.Session()
+        session.headers.update(DEFAULT_HEADERS)
+
+        pages = 0
+        while queue and pages < self.max_pages:
+            current_url = queue.pop(0)
+            if current_url in visited:
+                continue
+            visited.add(current_url)
+            pages += 1
+
+            status = None
+            try:
+                r = session.head(current_url, timeout=5, allow_redirects=True)
+                status = r.status_code
+                # некоторые сайты не любят HEAD
+                if status in (405, 403) or status is None:
+                    r = session.get(current_url, timeout=8, allow_redirects=True)
+                    status = r.status_code
+            except Exception as e:
+                logger.warning(f"Request error {current_url}: {e}")
+                broken.append((current_url, 0))
+                # не расширяем ссылки если страница недоступна
+                continue
+
+            if status >= 400:
+                broken.append((current_url, status))
+                continue
+
+            # собрать внутренние ссылки, если страница ок
+            try:
+                r = session.get(current_url, timeout=8, allow_redirects=True)
+                html = r.text
+                for href in self._extract_internal_links(current_url, html):
+                    if href not in visited and href not in queue:
+                        queue.append(href)
+            except Exception as e:
+                logger.warning(f"Ошибка парсинга ссылок на {current_url}: {e}")
+
         return broken
